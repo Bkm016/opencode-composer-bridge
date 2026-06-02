@@ -1,0 +1,6 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "opencode-composer-bridge@git+https://github.com/bkm016/opencode-composer-bridge.git"
+  ]
+}
