@@ -8,7 +8,7 @@
  */
 
 const CURSOR_TOOL_MAP =
-  "StrReplace/search_replace→edit; Write→write; Read→read; list_dir/LS→read或glob; Grep/codebase_search→grep; Glob/file_search→glob; ApplyPatch(Cursor)→edit或apply_patch(patchText); Delete→bash。"
+  "StrReplace/search_replace→edit; Write→write; Read→read; list_dir/LS→read或glob; Grep/codebase_search→grep; Glob/file_search→glob; run_terminal_cmd→bash; ApplyPatch(Cursor)→edit或apply_patch(patchText); Delete→bash。"
 
 import fs from "fs"
 import path from "path"
@@ -150,6 +150,16 @@ const performFileReplace = (
   }
   fs.writeFileSync(filepath, next, "utf8")
   return "Wrote file successfully."
+}
+
+/** Cursor Write 常用 contents，OpenCode 为 content */
+const resolveWriteContent = (args: ArgRecord, toolName: string): string => {
+  const keys = ["content", "contents", "text", "body"]
+  for (const key of keys) {
+    const v = args[key]
+    if (typeof v === "string") return v
+  }
+  missingParam(toolName, "content", keys, [{ path: "a.kt", contents: "..." }], args)
 }
 
 const resolveFilePath = (args: ArgRecord, toolName: string): string => {
@@ -361,7 +371,8 @@ const grepWithRipgrep = (
 const TOOL_DOC = {
   read:
     "Read file. Required: filePath OR path. Optional: offset, limit (1-based). Example: {\"path\":\"a.kt\",\"offset\":1,\"limit\":50}",
-  write: "Write file. Required: (filePath|path) + content. Example: {\"path\":\"out.txt\",\"content\":\"hi\"}",
+  write:
+    "Write file. Required: (filePath|path) + content OR contents. Example: {\"path\":\"out.txt\",\"contents\":\"...\"}",
   edit:
     "Edit file. Required: (filePath|path) + oldString + newString. Example: {\"path\":\"a.kt\",\"oldString\":\"x\",\"newString\":\"y\"}",
   StrReplace:
@@ -403,7 +414,7 @@ const OpencodeComposerBridgePlugin = async () => {
     ) => {
       output.system.push(
         `## Cursor / Composer → OpenCode\n${CURSOR_TOOL_MAP}\n` +
-          "改文件: **edit**（path + oldString + newString）。整文件: **write**。勿用未注册工具名。",
+          "改文件: **edit**。整文件: **write**。终端: **bash**（勿用 run_terminal_cmd）。勿用未注册工具名。",
       )
     },
 
@@ -415,6 +426,8 @@ const OpencodeComposerBridgePlugin = async () => {
       Delete: cursorStub("Delete", "bash"),
       delete_file: cursorStub("delete_file", "bash"),
       MultiEdit: cursorStub("MultiEdit", "多次 edit"),
+      run_terminal_cmd: cursorStub("run_terminal_cmd", "bash"),
+      run_terminal_command: cursorStub("run_terminal_command", "bash"),
       codebase_search: cursorStub("codebase_search", "grep"),
       file_search: cursorStub("file_search", "glob"),
       read: tool({
@@ -487,13 +500,16 @@ const OpencodeComposerBridgePlugin = async () => {
         args: {
           filePath: tool.schema.string().optional(),
           path: tool.schema.string().optional(),
-          content: tool.schema.string(),
+          content: tool.schema.string().optional(),
+          contents: tool.schema.string().optional(),
         },
         async execute(args, ctx) {
-          const rel = resolveFilePath(args as ArgRecord, "write")
+          const a = args as ArgRecord
+          const rel = resolveFilePath(a, "write")
           const filepath = normalizeWin(resolveAbs(rel, ctx.directory))
+          const body = resolveWriteContent(a, "write")
           fs.mkdirSync(path.dirname(filepath), { recursive: true })
-          fs.writeFileSync(filepath, args.content, "utf8")
+          fs.writeFileSync(filepath, body, "utf8")
           return "Wrote file successfully."
         },
       }),
@@ -503,13 +519,16 @@ const OpencodeComposerBridgePlugin = async () => {
         args: {
           filePath: tool.schema.string().optional(),
           path: tool.schema.string().optional(),
-          content: tool.schema.string(),
+          content: tool.schema.string().optional(),
+          contents: tool.schema.string().optional(),
         },
         async execute(args, ctx) {
-          const rel = resolveFilePath(args as ArgRecord, "Write")
+          const a = args as ArgRecord
+          const rel = resolveFilePath(a, "Write")
           const filepath = normalizeWin(resolveAbs(rel, ctx.directory))
+          const body = resolveWriteContent(a, "Write")
           fs.mkdirSync(path.dirname(filepath), { recursive: true })
-          fs.writeFileSync(filepath, args.content, "utf8")
+          fs.writeFileSync(filepath, body, "utf8")
           return "Wrote file successfully."
         },
       }),
