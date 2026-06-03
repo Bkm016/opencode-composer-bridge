@@ -355,6 +355,88 @@ const runBridgedShell = (directory: string, args: ArgRecord, toolName: string): 
   return parts.join("\n")
 }
 
+/** 内置/插件 write·read·edit 调用前：Cursor 字段 → OpenCode 校验认可的键 */
+const normalizeIoToolArgs = (toolName: string, a: ArgRecord): void => {
+  const isWrite = toolName === "write" || toolName === "Write"
+  const isRead = toolName === "read"
+  const isEdit =
+    toolName === "edit" ||
+    toolName === "StrReplace" ||
+    toolName === "strreplace" ||
+    toolName === "search_replace"
+  if (isWrite || isRead || isEdit) {
+    const fp = pickString(a, PATH_KEYS)
+    if (fp) {
+      if (!a.path) a.path = fp
+      if (!a.filePath) a.filePath = fp
+    }
+  }
+  if (isWrite) {
+    const body = pickString(a, WRITE_BODY_KEYS, false)
+    if (body !== undefined) {
+      if (a.content === undefined) a.content = body
+      if (a.contents === undefined) a.contents = body
+    }
+  }
+  if (isEdit) {
+    const old = pickString(a, EDIT_OLD_KEYS, false)
+    const neu = pickString(a, EDIT_NEW_KEYS, false)
+    if (old !== undefined) {
+      if (a.oldString === undefined) a.oldString = old
+      if (a.old_string === undefined) a.old_string = old
+    }
+    if (neu !== undefined) {
+      if (a.newString === undefined) a.newString = neu
+      if (a.new_string === undefined) a.new_string = neu
+    }
+  }
+}
+
+const patchToolParametersForCursor = (toolID: string, parameters: unknown): void => {
+  if (!parameters || typeof parameters !== "object") return
+  const schema = parameters as Record<string, unknown>
+  if (schema.type !== "object") return
+  const props = (schema.properties ?? {}) as Record<string, unknown>
+  schema.properties = props
+  schema.additionalProperties = true
+
+  const pathProps = {
+    path: { type: "string", description: "File path" },
+    filePath: { type: "string", description: "Alias of path (Cursor)" },
+    file: { type: "string", description: "Alias of path" },
+  }
+
+  if (toolID === "write" || toolID === "Write") {
+    Object.assign(props, pathProps, {
+      content: { type: "string", description: "File body" },
+      contents: { type: "string", description: "Alias of content (Cursor)" },
+      text: { type: "string" },
+      body: { type: "string" },
+    })
+    schema.required = []
+    return
+  }
+  if (toolID === "read") {
+    Object.assign(props, pathProps, {
+      offset: { type: "integer" },
+      limit: { type: "integer" },
+    })
+    schema.required = []
+    return
+  }
+  if (toolID === "edit" || toolID === "StrReplace" || toolID === "search_replace") {
+    Object.assign(props, pathProps, {
+      oldString: { type: "string" },
+      newString: { type: "string" },
+      old_string: { type: "string" },
+      new_string: { type: "string" },
+      replaceAll: { type: "boolean" },
+      replace_all: { type: "boolean" },
+    })
+    schema.required = []
+  }
+}
+
 const normalizeBuiltinToolArgs = (toolName: string, a: ArgRecord): void => {
   const isGrep =
     toolName === "grep" ||
@@ -702,8 +784,10 @@ export const OpencodeComposerBridgePlugin: Plugin = async (input) => {
       input: { toolID: string },
       output: { description: string; parameters: unknown },
     ) => {
-      const extra = TOOL_DOC[input.toolID as keyof typeof TOOL_DOC]
+      const id = input.toolID
+      const extra = TOOL_DOC[id as keyof typeof TOOL_DOC]
       if (extra) output.description = `${output.description}\n\n[opencode-composer-bridge] ${extra}`
+      patchToolParametersForCursor(id, output.parameters)
     },
 
     "experimental.chat.system.transform": async (
@@ -723,6 +807,7 @@ export const OpencodeComposerBridgePlugin: Plugin = async (input) => {
       const name = input.tool
       const a = (output.args ?? {}) as ArgRecord
       output.args = a
+      normalizeIoToolArgs(name, a)
       normalizeBuiltinToolArgs(name, a)
     },
 
