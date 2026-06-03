@@ -22,6 +22,9 @@ const MAX_LINE_SUFFIX = `... (line truncated to ${MAX_LINE_LENGTH} chars)`
 const MAX_BYTES = 50 * 1024
 const MAX_BYTES_LABEL = `${MAX_BYTES / 1024} KB`
 const SAMPLE_BYTES = 4096
+const SEARCH_RESULT_CAP = 100
+const SEARCH_RESULT_MAX = 500
+
 const PATH_KEYS = ["filePath", "path", "file", "filepath", "file_path"]
 const GLOB_PATTERN_KEYS = ["pattern", "glob_pattern", "glob", "file_pattern"]
 const GREP_PATTERN_KEYS = ["pattern", "query", "search", "regex"]
@@ -32,6 +35,23 @@ const DEFAULT_SHELL_TIMEOUT_MS = 120_000
 const WRITE_BODY_KEYS = ["content", "contents", "text", "body"]
 const EDIT_OLD_KEYS = ["oldString", "old_string", "old_str", "oldText", "old_text"]
 const EDIT_NEW_KEYS = ["newString", "new_string", "new_str", "newText", "new_text"]
+
+const EDIT_TOOL_NAMES = new Set(["edit", "StrReplace", "strreplace", "search_replace"])
+const WRITE_TOOL_NAMES = new Set(["write", "Write"])
+const GREP_TOOL_NAMES = new Set(["grep", "Grep", "codebase_search"])
+const GLOB_TOOL_NAMES = new Set(["glob", "Glob", "file_search"])
+
+const pickString = (args: ArgRecord, keys: string[], trim = true): string | undefined => {
+  for (const key of keys) {
+    const v = args[key]
+    if (typeof v === "string") {
+      const s = trim ? v.trim() : v
+      if (trim && s.length === 0) continue
+      return s
+    }
+  }
+  return undefined
+}
 
 const keysReceived = (args: ArgRecord): string => {
   const keys = Object.keys(args).filter((k) => args[k] !== undefined && args[k] !== null)
@@ -54,17 +74,18 @@ const missingParam = (
   )
 }
 
-const pickString = (args: ArgRecord, keys: string[], trim = true): string | undefined => {
-  for (const key of keys) {
-    const v = args[key]
-    if (typeof v === "string") {
-      const s = trim ? v.trim() : v
-      if (trim && s.length === 0) continue
-      return s
-    }
+const mirrorString = (a: ArgRecord, fromKeys: string[], ...targetKeys: string[]) => {
+  const v = pickString(a, fromKeys, false)
+  if (v === undefined) return
+  for (const k of targetKeys) {
+    if (a[k] === undefined) a[k] = v
   }
-  return undefined
 }
+
+const resolveAbs = (file: string, directory: string): string =>
+  path.isAbsolute(file) ? path.normalize(file) : path.resolve(directory, file)
+
+const normalizeWin = (p: string): string => (process.platform === "win32" ? path.normalize(p) : p)
 
 const resolveFilePath = (args: ArgRecord, toolName: string): string => {
   const v = pickString(args, PATH_KEYS)
@@ -77,11 +98,6 @@ const resolveWriteContent = (args: ArgRecord, toolName: string): string => {
   if (v !== undefined) return v
   missingParam(toolName, "content", WRITE_BODY_KEYS, [{ path: "a.kt", contents: "..." }], args)
 }
-
-const resolveAbs = (file: string, directory: string): string =>
-  path.isAbsolute(file) ? path.normalize(file) : path.resolve(directory, file)
-
-const normalizeWin = (p: string): string => (process.platform === "win32" ? path.normalize(p) : p)
 
 const resolveReplaceStrings = (
   args: ArgRecord,
@@ -148,6 +164,27 @@ const applyTextReplace = (
   return null
 }
 
+const fileNotFoundHint = (filepath: string): string => {
+  const dir = path.dirname(filepath)
+  const base = path.basename(filepath)
+  try {
+    const similar = fs
+      .readdirSync(dir)
+      .filter(
+        (item) =>
+          item.toLowerCase().includes(base.toLowerCase()) || base.toLowerCase().includes(item.toLowerCase()),
+      )
+      .slice(0, 3)
+      .map((item) => path.join(dir, item))
+    if (similar.length > 0) {
+      return `File not found: ${filepath}\n\nDid you mean one of these?\n${similar.join("\n")}`
+    }
+  } catch {
+    // 目录不可读
+  }
+  return `File not found: ${filepath}`
+}
+
 const performFileReplace = (directory: string, args: ArgRecord, toolName: string): string => {
   const filepath = normalizeWin(resolveAbs(resolveFilePath(args, toolName), directory))
   if (!fs.existsSync(filepath)) throw new Error(fileNotFoundHint(filepath))
@@ -165,7 +202,24 @@ const performFileReplace = (directory: string, args: ArgRecord, toolName: string
   return "Wrote file successfully."
 }
 
-type MultiEditEntry = { path?: string; filePath?: string; oldString?: string; newString?: string; old_string?: string; new_string?: string; replaceAll?: boolean; replace_all?: boolean }
+const performWrite = (directory: string, args: ArgRecord, toolName: string): string => {
+  const filepath = normalizeWin(resolveAbs(resolveFilePath(args, toolName), directory))
+  const body = resolveWriteContent(args, toolName)
+  fs.mkdirSync(path.dirname(filepath), { recursive: true })
+  fs.writeFileSync(filepath, body, "utf8")
+  return "Wrote file successfully."
+}
+
+type MultiEditEntry = {
+  path?: string
+  filePath?: string
+  oldString?: string
+  newString?: string
+  old_string?: string
+  new_string?: string
+  replaceAll?: boolean
+  replace_all?: boolean
+}
 
 const performMultiEdit = (directory: string, args: ArgRecord, toolName: string): string => {
   const raw = args.edits ?? args.changes ?? args.operations
@@ -192,14 +246,6 @@ const performMultiEdit = (directory: string, args: ArgRecord, toolName: string):
   return results.join("\n")
 }
 
-const performWrite = (directory: string, args: ArgRecord, toolName: string): string => {
-  const filepath = normalizeWin(resolveAbs(resolveFilePath(args, toolName), directory))
-  const body = resolveWriteContent(args, toolName)
-  fs.mkdirSync(path.dirname(filepath), { recursive: true })
-  fs.writeFileSync(filepath, body, "utf8")
-  return "Wrote file successfully."
-}
-
 const isBinaryFile = (filepath: string, bytes: Buffer): boolean => {
   const ext = path.extname(filepath).toLowerCase()
   const binExt = new Set([
@@ -214,27 +260,6 @@ const isBinaryFile = (filepath: string, bytes: Buffer): boolean => {
     if (bytes[i] < 9 || (bytes[i] > 13 && bytes[i] < 32)) nonPrintable++
   }
   return nonPrintable / bytes.length > 0.3
-}
-
-const fileNotFoundHint = (filepath: string): string => {
-  const dir = path.dirname(filepath)
-  const base = path.basename(filepath)
-  try {
-    const similar = fs
-      .readdirSync(dir)
-      .filter(
-        (item) =>
-          item.toLowerCase().includes(base.toLowerCase()) || base.toLowerCase().includes(item.toLowerCase()),
-      )
-      .slice(0, 3)
-      .map((item) => path.join(dir, item))
-    if (similar.length > 0) {
-      return `File not found: ${filepath}\n\nDid you mean one of these?\n${similar.join("\n")}`
-    }
-  } catch {
-    // 目录不可读
-  }
-  return `File not found: ${filepath}`
 }
 
 const readTextLines = (
@@ -298,28 +323,32 @@ const formatDirectoryListing = (filepath: string, offset: number, limit: number)
   ].join("\n")
 }
 
-const resolveListDirPath = (args: ArgRecord, directory: string): string => {
-  const raw = pickString(args, PATH_KEYS)
-  const rel = raw ?? "."
-  return normalizeWin(resolveAbs(rel, directory))
+const formatReadFileOutput = (
+  filepath: string,
+  file: { raw: string[]; count: number; cut: boolean; more: boolean },
+  offset: number,
+): string => {
+  let output = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
+  output += file.raw.map((line, i) => `${i + offset}: ${line}`).join("\n")
+  const last = offset + file.raw.length - 1
+  const next = last + 1
+  if (file.cut) {
+    output += `\n\n(Output capped at ${MAX_BYTES_LABEL}. Lines ${offset}-${last}. offset=${next})`
+  } else if (file.more) {
+    output += `\n\n(Lines ${offset}-${last} of ${file.count}. offset=${next})`
+  } else {
+    output += `\n\n(End of file - ${file.count} lines)`
+  }
+  return `${output}\n</content>`
 }
 
-const resolveShellCommand = (args: ArgRecord): string | undefined => {
-  const v = pickString(args, RUN_CMD_KEYS, false)
-  if (v !== undefined && v.length > 0) return v
-  return undefined
-}
-
-/** Cursor run_terminal_cmd：本地 shell 执行，语义对齐 bash（非 OpenCode 持久会话） */
 const runBridgedShell = (directory: string, args: ArgRecord, toolName: string): string => {
-  const command = resolveShellCommand(args)
+  const command = pickString(args, RUN_CMD_KEYS, false)
   if (!command) {
     return `[${toolName}] 未提供 command，未执行。示例: {"command":"echo ok"}`
   }
   const workdirRaw = pickString(args, WORKDIR_KEYS)
-  const cwd = workdirRaw
-    ? normalizeWin(resolveAbs(workdirRaw, directory))
-    : directory
+  const cwd = workdirRaw ? normalizeWin(resolveAbs(workdirRaw, directory)) : directory
   if (!fs.existsSync(cwd)) throw new Error(`[${toolName}] workdir 不存在: ${cwd}`)
   const timeoutMs =
     typeof args.timeout === "number" && args.timeout > 0
@@ -355,41 +384,23 @@ const runBridgedShell = (directory: string, args: ArgRecord, toolName: string): 
   return parts.join("\n")
 }
 
-/** 内置/插件 write·read·edit 调用前：Cursor 字段 → OpenCode 校验认可的键 */
 const normalizeIoToolArgs = (toolName: string, a: ArgRecord): void => {
-  const isWrite = toolName === "write" || toolName === "Write"
-  const isRead = toolName === "read"
-  const isEdit =
-    toolName === "edit" ||
-    toolName === "StrReplace" ||
-    toolName === "strreplace" ||
-    toolName === "search_replace"
-  if (isWrite || isRead || isEdit) {
-    const fp = pickString(a, PATH_KEYS)
-    if (fp) {
-      if (!a.path) a.path = fp
-      if (!a.filePath) a.filePath = fp
-    }
+  if (WRITE_TOOL_NAMES.has(toolName) || toolName === "read" || EDIT_TOOL_NAMES.has(toolName)) {
+    mirrorString(a, PATH_KEYS, "path", "filePath")
   }
-  if (isWrite) {
-    const body = pickString(a, WRITE_BODY_KEYS, false)
-    if (body !== undefined) {
-      if (a.content === undefined) a.content = body
-      if (a.contents === undefined) a.contents = body
-    }
+  if (WRITE_TOOL_NAMES.has(toolName)) {
+    mirrorString(a, WRITE_BODY_KEYS, "content", "contents")
   }
-  if (isEdit) {
-    const old = pickString(a, EDIT_OLD_KEYS, false)
-    const neu = pickString(a, EDIT_NEW_KEYS, false)
-    if (old !== undefined) {
-      if (a.oldString === undefined) a.oldString = old
-      if (a.old_string === undefined) a.old_string = old
-    }
-    if (neu !== undefined) {
-      if (a.newString === undefined) a.newString = neu
-      if (a.new_string === undefined) a.new_string = neu
-    }
+  if (EDIT_TOOL_NAMES.has(toolName)) {
+    mirrorString(a, EDIT_OLD_KEYS, "oldString", "old_string")
+    mirrorString(a, EDIT_NEW_KEYS, "newString", "new_string")
   }
+}
+
+const JSON_PATH_PROPS = {
+  path: { type: "string", description: "File path" },
+  filePath: { type: "string", description: "Alias of path (Cursor)" },
+  file: { type: "string", description: "Alias of path" },
 }
 
 const patchToolParametersForCursor = (toolID: string, parameters: unknown): void => {
@@ -399,33 +410,23 @@ const patchToolParametersForCursor = (toolID: string, parameters: unknown): void
   const props = (schema.properties ?? {}) as Record<string, unknown>
   schema.properties = props
   schema.additionalProperties = true
+  schema.required = []
 
-  const pathProps = {
-    path: { type: "string", description: "File path" },
-    filePath: { type: "string", description: "Alias of path (Cursor)" },
-    file: { type: "string", description: "Alias of path" },
-  }
-
-  if (toolID === "write" || toolID === "Write") {
-    Object.assign(props, pathProps, {
+  if (WRITE_TOOL_NAMES.has(toolID)) {
+    Object.assign(props, JSON_PATH_PROPS, {
       content: { type: "string", description: "File body" },
       contents: { type: "string", description: "Alias of content (Cursor)" },
       text: { type: "string" },
       body: { type: "string" },
     })
-    schema.required = []
     return
   }
   if (toolID === "read") {
-    Object.assign(props, pathProps, {
-      offset: { type: "integer" },
-      limit: { type: "integer" },
-    })
-    schema.required = []
+    Object.assign(props, JSON_PATH_PROPS, { offset: { type: "integer" }, limit: { type: "integer" } })
     return
   }
-  if (toolID === "edit" || toolID === "StrReplace" || toolID === "search_replace") {
-    Object.assign(props, pathProps, {
+  if (EDIT_TOOL_NAMES.has(toolID)) {
+    Object.assign(props, JSON_PATH_PROPS, {
       oldString: { type: "string" },
       newString: { type: "string" },
       old_string: { type: "string" },
@@ -433,33 +434,21 @@ const patchToolParametersForCursor = (toolID: string, parameters: unknown): void
       replaceAll: { type: "boolean" },
       replace_all: { type: "boolean" },
     })
-    schema.required = []
   }
 }
 
 const normalizeBuiltinToolArgs = (toolName: string, a: ArgRecord): void => {
-  const isGrep =
-    toolName === "grep" ||
-    toolName === "Grep" ||
-    toolName === "codebase_search"
-  const isGlob =
-    toolName === "glob" || toolName === "Glob" || toolName === "file_search"
-  if (!isGrep && !isGlob) return
-
-  if (isGrep) {
-    if (!pickString(a, ["pattern"]) && pickString(a, ["query", "search", "regex"])) {
+  if (GREP_TOOL_NAMES.has(toolName)) {
+    if (!pickString(a, ["pattern"])) {
       const p = pickString(a, GREP_PATTERN_KEYS)
       if (p) a.pattern = p
     }
     const inc = pickString(a, ["include", "glob"], false)
     if (inc && !a.include) a.include = inc.startsWith("**/") ? inc.slice(3) : inc
-    for (const k of ["query", "search", "regex", "glob", "glob_pattern", "file_pattern"]) {
-      delete a[k]
-    }
+    for (const k of ["query", "search", "regex", "glob", "glob_pattern", "file_pattern"]) delete a[k]
   }
-
-  if (isGlob) {
-    if (!pickString(a, ["pattern"]) && pickString(a, GLOB_PATTERN_KEYS)) {
+  if (GLOB_TOOL_NAMES.has(toolName)) {
+    if (!pickString(a, ["pattern"])) {
       const p = pickString(a, GLOB_PATTERN_KEYS)
       if (p) a.pattern = p
     }
@@ -470,6 +459,19 @@ const normalizeBuiltinToolArgs = (toolName: string, a: ArgRecord): void => {
     }
     if (!pickString(a, ["pattern"])) a.pattern = "**/*"
   }
+}
+
+const resolveSearchDirectory = (a: ArgRecord, ctxDir: string): string => {
+  const raw = pickString(a, SEARCH_ROOT_KEYS) ?? pickString(a, PATH_KEYS) ?? "."
+  const abs = normalizeWin(resolveAbs(raw, ctxDir))
+  if (fs.existsSync(abs) && fs.statSync(abs).isFile()) return path.dirname(abs)
+  return abs
+}
+
+const searchResultLimit = (a: ArgRecord): number => {
+  if (typeof a.head_limit === "number") return Math.min(a.head_limit, SEARCH_RESULT_MAX)
+  if (typeof a.limit === "number") return Math.min(a.limit, SEARCH_RESULT_MAX)
+  return SEARCH_RESULT_CAP
 }
 
 const coerceGrepPattern = (a: ArgRecord): string | undefined => {
@@ -493,41 +495,83 @@ const coerceFileFindQuery = (a: ArgRecord): string => {
   return "**/*"
 }
 
-const resolveSearchDirectory = (a: ArgRecord, ctxDir: string): string => {
-  const raw = pickString(a, SEARCH_ROOT_KEYS) ?? pickString(a, PATH_KEYS) ?? "."
-  const abs = normalizeWin(resolveAbs(raw, ctxDir))
-  if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
-    return path.dirname(abs)
+const looksLikeGlobPattern = (q: string): boolean => /[*?[\]]/.test(q)
+
+const SKIP_DIR_NAMES = new Set([".git", "node_modules", ".svn", ".hg"])
+
+const globPatternToRegExp = (glob: string): RegExp => {
+  const g = glob.replace(/\\/g, "/")
+  let re = "^"
+  for (let i = 0; i < g.length; i++) {
+    const c = g[i]
+    if (c === "*" && g[i + 1] === "*") {
+      if (g[i + 2] === "/") {
+        re += "(?:.*/)?"
+        i += 2
+      } else {
+        re += ".*"
+        i += 1
+      }
+    } else if (c === "*") {
+      re += "[^/]*"
+    } else if (c === "?") {
+      re += "[^/]"
+    } else {
+      re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    }
   }
-  return abs
+  re += "$"
+  return new RegExp(re, "i")
 }
+
+const listPathsMatchingGlob = (rootDir: string, pattern: string, cap: number): string[] => {
+  const root = normalizeWin(path.resolve(rootDir))
+  const re = globPatternToRegExp(pattern)
+  const out: string[] = []
+  const walk = (dir: string) => {
+    if (out.length >= cap) return
+    let entries: fs.Dirent[]
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const ent of entries) {
+      if (out.length >= cap) return
+      const full = path.join(dir, ent.name)
+      if (ent.isDirectory()) {
+        if (SKIP_DIR_NAMES.has(ent.name)) continue
+        walk(full)
+        continue
+      }
+      if (!ent.isFile()) continue
+      const rel = path.relative(root, full).replace(/\\/g, "/")
+      if (re.test(rel) || re.test(ent.name)) out.push(full)
+    }
+  }
+  walk(root)
+  return out.sort((a, b) => a.localeCompare(b))
+}
+
+const formatPathList = (paths: string[], limit: number): string => {
+  if (paths.length === 0) return "No files found"
+  const truncated = paths.length > limit
+  const shown = truncated ? paths.slice(0, limit) : paths
+  const out = [`Found ${paths.length} path(s)${truncated ? ` (showing first ${limit})` : ""}`, ...shown]
+  if (truncated) out.push("", `(Truncated: ${limit} of ${paths.length} shown.)`)
+  return out.join("\n")
+}
+
+const globAliasStubNote = (label: string): string =>
+  `\n\n[${label}] 通配/大目录更稳更快：请优先用内置 **glob**（小写）。${CURSOR_TOOL_MAP}`
 
 const softSearchHint = (toolName: string, kind: "text" | "files"): string =>
   `[${toolName}] 未提供搜索内容，未执行检索。\n` +
   (kind === "text"
     ? '请传入 pattern / query，例如: {"pattern":"Foo","path":"."}'
-    : '请传入 pattern / query，例如: {"pattern":"**/*.kt","path":"."} 或 {"query":"README"}')
+    : '请传入 pattern / query，例如: {"pattern":"**/*.kt","path":"."}')
 
-const TOOL_DOC = {
-  read:
-    "Read file. Required: filePath OR path. Optional: offset, limit (1-based). Example: {\"path\":\"a.kt\",\"offset\":1,\"limit\":50}",
-  write:
-    "Write file. Required: (filePath|path) + content OR contents. Example: {\"path\":\"out.txt\",\"contents\":\"...\"}",
-  edit:
-    "Edit file. Required: (filePath|path) + oldString + newString. Example: {\"path\":\"a.kt\",\"oldString\":\"x\",\"newString\":\"y\"}",
-  StrReplace:
-    "Same as edit (Cursor alias). Example: {\"path\":\"a.kt\",\"old_string\":\"x\",\"new_string\":\"y\"}",
-  glob:
-    "Glob files. Required: pattern OR glob_pattern. Optional: path OR target_directory. Example: {\"pattern\":\"**/*.kt\",\"path\":\".\"}",
-  grep:
-    "Grep content. Required: pattern OR query. Optional: path, include/glob, head_limit. Example: {\"pattern\":\"Foo|Bar\",\"path\":\".\",\"glob\":\"**/*.kt\",\"head_limit\":25}",
-}
-
-type FindTextRow = {
-  path: { text: string }
-  lines: { text: string }
-  line_number: number
-}
+type FindTextRow = { path: { text: string }; lines: { text: string }; line_number: number }
 
 const formatSdkError = (err: unknown): string => {
   if (err == null) return "unknown"
@@ -546,9 +590,7 @@ const formatSdkError = (err: unknown): string => {
 }
 
 const unwrapSdkData = <T>(res: { data?: T; error?: unknown }): T => {
-  if (res.error) {
-    throw new Error(`[opencode find API] ${formatSdkError(res.error)}`)
-  }
+  if (res.error) throw new Error(`[opencode find API] ${formatSdkError(res.error)}`)
   if (res.data === undefined) throw new Error("[opencode find API] 无返回数据")
   return res.data
 }
@@ -557,9 +599,7 @@ const formatFindTextResults = (rows: FindTextRow[], cap: number): string => {
   if (rows.length === 0) return "No files found"
   const truncated = rows.length > cap
   const slice = truncated ? rows.slice(0, cap) : rows
-  const lines: string[] = [
-    `Found ${rows.length} matches${truncated ? ` (showing first ${cap})` : ""}`,
-  ]
+  const lines: string[] = [`Found ${rows.length} matches${truncated ? ` (showing first ${cap})` : ""}`]
   let current = ""
   for (const row of slice) {
     const fp = row.path.text
@@ -581,83 +621,20 @@ const formatFindTextResults = (rows: FindTextRow[], cap: number): string => {
   return lines.join("\n")
 }
 
-const cursorSearchArgSchema = {
-  pattern: tool.schema.string().optional(),
-  query: tool.schema.string().optional(),
-  search: tool.schema.string().optional(),
-  regex: tool.schema.string().optional(),
-  path: tool.schema.string().optional(),
-  target_directory: tool.schema.string().optional(),
-  include: tool.schema.string().optional(),
-  glob: tool.schema.string().optional(),
-  glob_pattern: tool.schema.string().optional(),
-  file_pattern: tool.schema.string().optional(),
-  head_limit: tool.schema.coerce.number().int().positive().optional(),
-  headLimit: tool.schema.coerce.number().int().positive().optional(),
-  limit: tool.schema.coerce.number().int().positive().optional(),
-  num: tool.schema.coerce.number().int().positive().optional(),
+const TOOL_DOC = {
+  read:
+    'Read file. Required: filePath OR path. Optional: offset, limit (1-based line numbers). Directory path lists entries. Example: {"path":"a.kt","offset":1,"limit":50}',
+  write:
+    'Write file. Required: (filePath|path) + (content OR contents). Example: {"path":"out.txt","contents":"..."}',
+  edit:
+    'Edit file. Required: (filePath|path) + oldString + newString (or old_string/new_string). Example: {"path":"a.kt","oldString":"x","newString":"y"}',
+  StrReplace:
+    'Same as edit (Cursor alias). Required: path + old_string + new_string. Example: {"path":"a.kt","old_string":"x","new_string":"y"}',
+  glob:
+    'Glob files. Required: pattern OR glob_pattern. Optional: path OR target_directory. Example: {"pattern":"**/*.kt","path":"."}',
+  grep:
+    'Grep content. Required: pattern OR query. Optional: path, include/glob, head_limit. Example: {"pattern":"Foo|Bar","path":".","glob":"**/*.kt","head_limit":25}',
 }
-
-const makeSdkTextSearchTool = (description: string, client: PluginInput["client"]) =>
-  tool({
-    description: `${description}（经 OpenCode 服务端 ripgrep，等同内置 grep）`,
-    args: cursorSearchArgSchema,
-    async execute(args, ctx) {
-      const a = { ...(args as ArgRecord) }
-      normalizeBuiltinToolArgs("grep", a)
-      const pattern = coerceGrepPattern(a)
-      if (!pattern) return softSearchHint(description, "text")
-      const directory = resolveSearchDirectory(a, ctx.directory)
-      let rows: FindTextRow[]
-      try {
-        const res = await client.find.text({
-          query: { directory, pattern },
-        })
-        rows = unwrapSdkData(res) as FindTextRow[]
-      } catch (e) {
-        return `[${description}] 检索失败: ${e instanceof Error ? e.message : String(e)}\nNo files found`
-      }
-      const cap =
-        typeof a.head_limit === "number"
-          ? Math.min(a.head_limit, 500)
-          : typeof a.limit === "number"
-            ? Math.min(a.limit, 500)
-            : 100
-      return formatFindTextResults(rows, cap)
-    },
-  })
-
-const makeSdkFileSearchTool = (description: string, client: PluginInput["client"]) =>
-  tool({
-    description: `${description}（经 OpenCode 服务端，等同内置 glob）`,
-    args: {
-      ...cursorSearchArgSchema,
-      query: tool.schema.string().optional(),
-    },
-    async execute(args, ctx) {
-      const a = { ...(args as ArgRecord) }
-      normalizeBuiltinToolArgs("glob", a)
-      const query = coerceFileFindQuery(a)
-      const directory = resolveSearchDirectory(a, ctx.directory)
-      const limit =
-        typeof a.limit === "number" ? Math.min(a.limit, 500) : typeof a.head_limit === "number" ? Math.min(a.head_limit, 500) : 100
-      let paths: string[]
-      try {
-        const res = await client.find.files({
-          query: { directory, query, limit },
-        })
-        paths = unwrapSdkData(res) as string[]
-      } catch (e) {
-        return `[${description}] 检索失败: ${e instanceof Error ? e.message : String(e)}\nNo files found`
-      }
-      if (paths.length === 0) return "No files found"
-      const truncated = paths.length > limit
-      const shown = truncated ? paths.slice(0, limit) : paths
-      const out = [`Found ${paths.length} path(s)${truncated ? ` (showing first ${limit})` : ""}`, ...shown]
-      if (truncated) out.push("", `(Truncated: ${limit} of ${paths.length} shown.)`)
-      return out.join("\n")
-    },
-  })
 
 const pathArgSchema = {
   filePath: tool.schema.string().optional(),
@@ -681,6 +658,23 @@ const writeArgSchema = {
   contents: tool.schema.string().optional(),
 }
 
+const cursorSearchArgSchema = {
+  pattern: tool.schema.string().optional(),
+  query: tool.schema.string().optional(),
+  search: tool.schema.string().optional(),
+  regex: tool.schema.string().optional(),
+  path: tool.schema.string().optional(),
+  target_directory: tool.schema.string().optional(),
+  include: tool.schema.string().optional(),
+  glob: tool.schema.string().optional(),
+  glob_pattern: tool.schema.string().optional(),
+  file_pattern: tool.schema.string().optional(),
+  head_limit: tool.schema.coerce.number().int().positive().optional(),
+  headLimit: tool.schema.coerce.number().int().positive().optional(),
+  limit: tool.schema.coerce.number().int().positive().optional(),
+  num: tool.schema.coerce.number().int().positive().optional(),
+}
+
 const makeEditTool = (id: string, description: string) =>
   tool({
     description,
@@ -699,35 +693,53 @@ const makeWriteTool = (id: string, description: string) =>
     },
   })
 
-const multiEditEntrySchema = tool.schema.object({
-  path: tool.schema.string().optional(),
-  filePath: tool.schema.string().optional(),
-  oldString: tool.schema.string().optional(),
-  newString: tool.schema.string().optional(),
-  old_string: tool.schema.string().optional(),
-  new_string: tool.schema.string().optional(),
-  replaceAll: tool.schema.boolean().optional(),
-  replace_all: tool.schema.boolean().optional(),
-})
-
-const multiEditArgSchema = {
-  edits: tool.schema.array(multiEditEntrySchema).optional(),
-  changes: tool.schema.array(multiEditEntrySchema).optional(),
-  operations: tool.schema.array(multiEditEntrySchema).optional(),
-}
-
-const makeMultiEditTool = (id: string) =>
+const makeSdkTextSearchTool = (label: string, client: PluginInput["client"]) =>
   tool({
-    description: `Cursor「${id}」→ 按 edits/changes 数组依次 StrReplace。`,
-    args: multiEditArgSchema,
+    description: `${label}（OpenCode 服务端 ripgrep）`,
+    args: cursorSearchArgSchema,
     async execute(args, ctx) {
-      return performMultiEdit(ctx.directory, args as ArgRecord, id)
+      const a = { ...(args as ArgRecord) }
+      normalizeBuiltinToolArgs("grep", a)
+      const pattern = coerceGrepPattern(a)
+      if (!pattern) return softSearchHint(label, "text")
+      const directory = resolveSearchDirectory(a, ctx.directory)
+      try {
+        const res = await client.find.text({ query: { directory, pattern } })
+        return formatFindTextResults(unwrapSdkData(res) as FindTextRow[], searchResultLimit(a))
+      } catch (e) {
+        return `[${label}] 检索失败: ${e instanceof Error ? e.message : String(e)}\nNo files found`
+      }
+    },
+  })
+
+const makeSdkFileSearchTool = (label: string, client: PluginInput["client"]) =>
+  tool({
+    description: `Cursor「${label}」→ 有结果；通配/大目录请优先内置 **glob**`,
+    args: { ...cursorSearchArgSchema, query: tool.schema.string().optional() },
+    async execute(args, ctx) {
+      const a = { ...(args as ArgRecord) }
+      normalizeBuiltinToolArgs("glob", a)
+      const query = coerceFileFindQuery(a)
+      const directory = resolveSearchDirectory(a, ctx.directory)
+      const limit = searchResultLimit(a)
+      const stub = globAliasStubNote(label)
+      if (looksLikeGlobPattern(query)) {
+        const paths = listPathsMatchingGlob(directory, query, Math.min(limit, SEARCH_RESULT_MAX))
+        return formatPathList(paths, limit) + stub
+      }
+      try {
+        const res = await client.find.files({ query: { directory, query, limit } })
+        const paths = unwrapSdkData(res) as string[]
+        return formatPathList(paths, limit) + stub
+      } catch (e) {
+        return `[${label}] 检索失败: ${e instanceof Error ? e.message : String(e)}\nNo files found` + stub
+      }
     },
   })
 
 const cursorStub = (name: string, use: string) =>
   tool({
-    description: `Cursor「${name}」→ 请用 **${use}**。`,
+    description: `Cursor「${name}」→ ${use}`,
     args: { note: tool.schema.string().optional() },
     async execute() {
       return `[${name}] 请改用: ${use}。（${CURSOR_TOOL_MAP}）`
@@ -742,14 +754,14 @@ const listDirArgSchema = {
 
 const makeListDirTool = (id: string) =>
   tool({
-    description: `Cursor「${id}」→ 列目录（同 read 对目录）。path 默认当前工作目录。`,
+    description: `Cursor「${id}」→ 列目录`,
     args: listDirArgSchema,
     async execute(args, ctx) {
       const a = args as ArgRecord
-      const filepath = resolveListDirPath(a, ctx.directory)
+      const filepath = normalizeWin(resolveAbs(pickString(a, PATH_KEYS) ?? ".", ctx.directory))
       if (!fs.existsSync(filepath)) throw new Error(fileNotFoundHint(filepath))
       if (!fs.statSync(filepath).isDirectory()) {
-        throw new Error(`[${id}] 不是目录: ${filepath}（请用 read 读文件）`)
+        throw new Error(`[${id}] 不是目录: ${filepath}`)
       }
       const limit = (args.limit as number | undefined) ?? DEFAULT_READ_LIMIT
       const offset = (args.offset as number | undefined) || 1
@@ -770,62 +782,74 @@ const runTerminalArgSchema = {
 
 const makeRunTerminalTool = (id: string) =>
   tool({
-    description: `Cursor「${id}」→ 本地 shell（PowerShell/sh）。优先用 OpenCode **bash** 若需持久会话。`,
+    description: `Cursor「${id}」→ 本地 shell`,
     args: runTerminalArgSchema,
     async execute(args, ctx) {
       return runBridgedShell(ctx.directory, args as ArgRecord, id)
     },
   })
 
+const multiEditEntrySchema = tool.schema.object({
+  path: tool.schema.string().optional(),
+  filePath: tool.schema.string().optional(),
+  oldString: tool.schema.string().optional(),
+  newString: tool.schema.string().optional(),
+  old_string: tool.schema.string().optional(),
+  new_string: tool.schema.string().optional(),
+  replaceAll: tool.schema.boolean().optional(),
+  replace_all: tool.schema.boolean().optional(),
+})
+
+const makeMultiEditTool = (id: string) =>
+  tool({
+    description: `Cursor「${id}」→ 批量 edit`,
+    args: {
+      edits: tool.schema.array(multiEditEntrySchema).optional(),
+      changes: tool.schema.array(multiEditEntrySchema).optional(),
+      operations: tool.schema.array(multiEditEntrySchema).optional(),
+    },
+    async execute(args, ctx) {
+      return performMultiEdit(ctx.directory, args as ArgRecord, id)
+    },
+  })
+
 export const OpencodeComposerBridgePlugin: Plugin = async (input) => {
   const { client } = input
   return {
-    "tool.definition": async (
-      input: { toolID: string },
-      output: { description: string; parameters: unknown },
-    ) => {
-      const id = input.toolID
-      const extra = TOOL_DOC[id as keyof typeof TOOL_DOC]
+    "tool.definition": async (inp: { toolID: string }, output: { description: string; parameters: unknown }) => {
+      const extra = TOOL_DOC[inp.toolID as keyof typeof TOOL_DOC]
       if (extra) output.description = `${output.description}\n\n[opencode-composer-bridge] ${extra}`
-      patchToolParametersForCursor(id, output.parameters)
+      patchToolParametersForCursor(inp.toolID, output.parameters)
     },
 
-    "experimental.chat.system.transform": async (
-      _input: { sessionID?: string },
-      output: { system: string[] },
-    ) => {
+    "experimental.chat.system.transform": async (_input, output: { system: string[] }) => {
       output.system.push(
         `## Cursor / Composer → OpenCode\n${CURSOR_TOOL_MAP}\n` +
-          "改文件: **edit**。整文件: **write**。搜代码: **grep** / **glob**（内置）；**Grep** / **Glob** / **codebase_search** 走服务端 find。终端: **bash**。",
+          "改文件: **edit**。整文件: **write**。搜代码: **grep** / **glob**；**Grep** / **Glob** / **codebase_search** 走服务端 find。终端: **bash**。",
       )
     },
 
-    "tool.execute.before": async (
-      input: { tool: string },
-      output: { args: unknown },
-    ) => {
-      const name = input.tool
+    "tool.execute.before": async (inp: { tool: string }, output: { args: unknown }) => {
       const a = (output.args ?? {}) as ArgRecord
       output.args = a
-      normalizeIoToolArgs(name, a)
-      normalizeBuiltinToolArgs(name, a)
+      normalizeIoToolArgs(inp.tool, a)
+      normalizeBuiltinToolArgs(inp.tool, a)
     },
 
     tool: {
       list_dir: makeListDirTool("list_dir"),
       ListDir: makeListDirTool("ListDir"),
       LS: makeListDirTool("LS"),
-      ApplyPatch: cursorStub("ApplyPatch", "StrReplace / edit（patch 传参易被截断）"),
-      Delete: cursorStub("Delete", "bash（勿在插件内自动删文件）"),
+      ApplyPatch: cursorStub("ApplyPatch", "StrReplace / edit"),
+      Delete: cursorStub("Delete", "bash（勿在插件内删文件）"),
       delete_file: cursorStub("delete_file", "bash"),
       MultiEdit: makeMultiEditTool("MultiEdit"),
       run_terminal_cmd: makeRunTerminalTool("run_terminal_cmd"),
       run_terminal_command: makeRunTerminalTool("run_terminal_command"),
-      codebase_search: makeSdkTextSearchTool("Cursor codebase_search", client),
-      file_search: makeSdkFileSearchTool("Cursor file_search", client),
-      Grep: makeSdkTextSearchTool("Cursor Grep", client),
-      Glob: makeSdkFileSearchTool("Cursor Glob", client),
-
+      codebase_search: makeSdkTextSearchTool("codebase_search", client),
+      file_search: makeSdkFileSearchTool("file_search", client),
+      Grep: makeSdkTextSearchTool("Grep", client),
+      Glob: makeSdkFileSearchTool("Glob", client),
       read: tool({
         description: TOOL_DOC.read,
         args: {
@@ -835,14 +859,12 @@ export const OpencodeComposerBridgePlugin: Plugin = async (input) => {
         },
         async execute(args, ctx) {
           const a = args as ArgRecord
-          let filepath = normalizeWin(resolveAbs(resolveFilePath(a, "read"), ctx.directory))
+          const filepath = normalizeWin(resolveAbs(resolveFilePath(a, "read"), ctx.directory))
           if (!fs.existsSync(filepath)) throw new Error(fileNotFoundHint(filepath))
           const stat = fs.statSync(filepath)
           const limit = (args.limit as number | undefined) ?? DEFAULT_READ_LIMIT
           const offset = (args.offset as number | undefined) || 1
-          if (stat.isDirectory()) {
-            return formatDirectoryListing(filepath, offset, limit)
-          }
+          if (stat.isDirectory()) return formatDirectoryListing(filepath, offset, limit)
           const sample = Buffer.alloc(Math.min(SAMPLE_BYTES, stat.size))
           const fd = fs.openSync(filepath, "r")
           try {
@@ -855,28 +877,15 @@ export const OpencodeComposerBridgePlugin: Plugin = async (input) => {
           if (file.count < offset && !(file.count === 0 && offset === 1)) {
             throw new Error(`Offset ${offset} is out of range (${file.count} lines)`)
           }
-          let output = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
-          output += file.raw.map((line, i) => `${i + offset}: ${line}`).join("\n")
-          const last = offset + file.raw.length - 1
-          const next = last + 1
-          if (file.cut) {
-            output += `\n\n(Output capped at ${MAX_BYTES_LABEL}. Lines ${offset}-${last}. offset=${next})`
-          } else if (file.more) {
-            output += `\n\n(Lines ${offset}-${last} of ${file.count}. offset=${next})`
-          } else {
-            output += `\n\n(End of file - ${file.count} lines)`
-          }
-          return `${output}\n</content>`
+          return formatReadFileOutput(filepath, file, offset)
         },
       }),
-
       write: makeWriteTool("write", TOOL_DOC.write),
-      Write: makeWriteTool("Write", "Cursor alias → same as write."),
-
+      Write: makeWriteTool("Write", "Cursor alias → write"),
       edit: makeEditTool("edit", TOOL_DOC.edit),
       StrReplace: makeEditTool("StrReplace", TOOL_DOC.StrReplace),
       strreplace: makeEditTool("strreplace", TOOL_DOC.StrReplace),
-      search_replace: makeEditTool("search_replace", "Cursor alias → same as edit."),
+      search_replace: makeEditTool("search_replace", "alias → edit"),
     },
   }
 }
