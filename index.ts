@@ -310,13 +310,21 @@ const listDirectory = (filepath: string, offset: number, limit: number): { items
   return { items: items.slice(start, start + limit), total: items.length }
 }
 
+const msSince = (start: bigint): number => Number(process.hrtime.bigint() - start) / 1e6
+
+const RG_TIMEOUT_MS = 30_000
+
 const runRipgrep = (args: string[], cwd: string): { ok: boolean; stdout: string; stderr: string } => {
   const result = spawnSync("rg", args, {
     cwd,
     encoding: "utf8",
     maxBuffer: 32 * 1024 * 1024,
     windowsHide: true,
+    timeout: RG_TIMEOUT_MS,
   })
+  if (result.error && (result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+    throw new Error(`[rg] 超时（>${RG_TIMEOUT_MS / 1000}s）。请缩小 path 或 pattern，勿对过大目录空参搜索。`)
+  }
   const ok = result.status === 0 || result.status === 1
   return {
     ok,
@@ -352,6 +360,9 @@ const grepWithRipgrep = (
   include?: string,
   singleFile?: string,
 ): { path: string; line: number; text: string }[] => {
+  if (!pattern.trim()) {
+    throw new Error("[grep] pattern 不能为空。示例: {\"pattern\":\"Foo\",\"path\":\".\"}")
+  }
   const args = ["-n", "--no-heading", pattern]
   if (include) args.push("-g", include)
   if (singleFile) args.push(singleFile)
@@ -416,6 +427,33 @@ const OpencodeComposerBridgePlugin = async () => {
         `## Cursor / Composer → OpenCode\n${CURSOR_TOOL_MAP}\n` +
           "改文件: **edit**。整文件: **write**。终端: **bash**（勿用 run_terminal_cmd）。勿用未注册工具名。",
       )
+    },
+
+    "tool.execute.before": async (
+      input: { tool: string; sessionID: string; callID: string },
+      output: { args: unknown },
+    ) => {
+      const name = input.tool
+      if (name !== "grep" && name !== "Grep" && name !== "glob" && name !== "Glob") return
+      const a = (output.args ?? {}) as ArgRecord
+      if (name === "grep" || name === "Grep") {
+        const has = ["pattern", "query", "search", "regex"].some(
+          (k) => typeof a[k] === "string" && String(a[k]).trim().length > 0,
+        )
+        if (!has) {
+          throw new Error(
+            `[${name}] 缺少 pattern（禁止空参数 {}）。示例: {"pattern":"sendPlayerListFooter","path":"."}`,
+          )
+        }
+      }
+      if (name === "glob" || name === "Glob") {
+        const has = ["pattern", "glob_pattern", "glob", "file_pattern"].some(
+          (k) => typeof a[k] === "string" && String(a[k]).trim().length > 0,
+        )
+        if (!has) {
+          throw new Error(`[${name}] 缺少 pattern。示例: {"pattern":"**/*.kt","path":"."}`)
+        }
+      }
     },
 
     tool: {
@@ -614,6 +652,7 @@ const OpencodeComposerBridgePlugin = async () => {
           cwd: tool.schema.string().optional(),
         },
         async execute(args, ctx) {
+          const t0 = process.hrtime.bigint()
           const a = args as ArgRecord
           const pattern = resolveGlobPattern(a)
           const search = normalizeWin(resolveAbs(resolveSearchRoot(a, ctx.directory), ctx.directory))
@@ -624,14 +663,20 @@ const OpencodeComposerBridgePlugin = async () => {
           if (!st.isDirectory()) {
             throw new Error(`glob path must be a directory: ${search}`)
           }
+          const tRg = process.hrtime.bigint()
           let paths = globWithRipgrep(search, pattern)
+          let rgMs = msSince(tRg)
+          let fgMs = 0
           if (paths.length === 0) {
+            const tFg = process.hrtime.bigint()
             try {
               paths = await globWithFastGlob(search, pattern)
             } catch {
               paths = []
             }
+            fgMs = msSince(tFg)
           }
+          const tStat = process.hrtime.bigint()
           const withMtime = paths.map((p) => {
             try {
               return { path: p, mtime: fs.statSync(p).mtimeMs }
@@ -640,12 +685,18 @@ const OpencodeComposerBridgePlugin = async () => {
             }
           })
           withMtime.sort((x, y) => y.mtime - x.mtime)
+          const statMs = msSince(tStat)
           let truncated = false
+          const totalFound = withMtime.length
           if (withMtime.length > GLOB_LIMIT) {
             truncated = true
             withMtime.length = GLOB_LIMIT
           }
-          const output: string[] = []
+          const totalMs = msSince(t0)
+          const timingParts = [`total ${totalMs.toFixed(1)}ms`, `rg ${rgMs.toFixed(1)}ms`]
+          if (fgMs > 0) timingParts.push(`fast-glob ${fgMs.toFixed(1)}ms`)
+          timingParts.push(`stat/sort ${statMs.toFixed(1)}ms`)
+          const output: string[] = [`[glob timing] ${timingParts.join(", ")} | found ${totalFound} path(s)`]
           if (withMtime.length === 0) output.push("No files found")
           else {
             output.push(...withMtime.map((f) => f.path))
@@ -685,10 +736,14 @@ const OpencodeComposerBridgePlugin = async () => {
           const cwd = info.isDirectory() ? requested : path.dirname(requested)
           const singleFile = info.isDirectory() ? undefined : requested
           const include = (a.include ?? a.glob) as string | undefined
+          const t0 = process.hrtime.bigint()
+          const tRg = process.hrtime.bigint()
           let rows = grepWithRipgrep(cwd, pattern, include, singleFile)
+          const rgMs = msSince(tRg)
           if (rows.length === 0) {
-            return "No files found"
+            return `[grep timing] total ${msSince(t0).toFixed(1)}ms, rg ${rgMs.toFixed(1)}ms | found 0 matches\nNo files found`
           }
+          const tPost = process.hrtime.bigint()
           const times = new Map<string, number>()
           for (const p of new Set(rows.map((r) => r.path))) {
             try {
@@ -704,7 +759,89 @@ const OpencodeComposerBridgePlugin = async () => {
           const total = matches.length
           const truncated = total > GREP_LIMIT
           const final = truncated ? matches.slice(0, GREP_LIMIT) : matches
-          const output = [`Found ${total} matches${truncated ? ` (showing first ${GREP_LIMIT})` : ""}`]
+          const postMs = msSince(tPost)
+          const totalMs = msSince(t0)
+          const output = [
+            `[grep timing] total ${totalMs.toFixed(1)}ms (rg ${rgMs.toFixed(1)}ms, post ${postMs.toFixed(1)}ms) | found ${total} match(es)`,
+            `Found ${total} matches${truncated ? ` (showing first ${GREP_LIMIT})` : ""}`,
+          ]
+          let current = ""
+          for (const match of final) {
+            if (current !== match.path) {
+              if (current !== "") output.push("")
+              current = match.path
+              output.push(`${match.path}:`)
+            }
+            const text =
+              match.text.length > MAX_LINE_LENGTH
+                ? match.text.substring(0, MAX_LINE_LENGTH) + "..."
+                : match.text
+            output.push(`  Line ${match.line}: ${text}`)
+          }
+          if (truncated) {
+            output.push("")
+            output.push(
+              `(Results truncated: showing ${GREP_LIMIT} of ${total} matches (${total - GREP_LIMIT} hidden). Consider using a more specific path or pattern.)`,
+            )
+          }
+          return output.join("\n")
+        },
+      }),
+
+      Grep: tool({
+        description: "Cursor alias → same as grep（必须带 pattern，禁止 {}）",
+        args: {
+          pattern: tool.schema.string().optional(),
+          query: tool.schema.string().optional(),
+          search: tool.schema.string().optional(),
+          regex: tool.schema.string().optional(),
+          path: tool.schema.string().optional(),
+          target_directory: tool.schema.string().optional(),
+          include: tool.schema.string().optional(),
+          glob: tool.schema.string().optional(),
+        },
+        async execute(args, ctx) {
+          const a = args as ArgRecord
+          const pattern = resolveGrepPattern(a)
+          const requested = normalizeWin(
+            resolveAbs(resolveSearchRoot(a, ctx.directory), ctx.directory),
+          )
+          if (!fs.existsSync(requested)) {
+            return "No files found"
+          }
+          const info = fs.statSync(requested)
+          const cwd = info.isDirectory() ? requested : path.dirname(requested)
+          const singleFile = info.isDirectory() ? undefined : requested
+          const include = (a.include ?? a.glob) as string | undefined
+          const t0 = process.hrtime.bigint()
+          const tRg = process.hrtime.bigint()
+          let rows = grepWithRipgrep(cwd, pattern, include, singleFile)
+          const rgMs = msSince(tRg)
+          if (rows.length === 0) {
+            return `[grep timing] total ${msSince(t0).toFixed(1)}ms, rg ${rgMs.toFixed(1)}ms | found 0 matches\nNo files found`
+          }
+          const tPost = process.hrtime.bigint()
+          const times = new Map<string, number>()
+          for (const p of new Set(rows.map((r) => r.path))) {
+            try {
+              times.set(p, fs.statSync(p).mtimeMs)
+            } catch {
+              // 跳过不可 stat 的路径
+            }
+          }
+          const matches = rows
+            .map((r) => ({ ...r, mtime: times.get(r.path) ?? 0 }))
+            .filter((r) => times.has(r.path))
+          matches.sort((x, y) => y.mtime - x.mtime)
+          const total = matches.length
+          const truncated = total > GREP_LIMIT
+          const final = truncated ? matches.slice(0, GREP_LIMIT) : matches
+          const postMs = msSince(tPost)
+          const totalMs = msSince(t0)
+          const output = [
+            `[grep timing] total ${totalMs.toFixed(1)}ms (rg ${rgMs.toFixed(1)}ms, post ${postMs.toFixed(1)}ms) | found ${total} match(es)`,
+            `Found ${total} matches${truncated ? ` (showing first ${GREP_LIMIT})` : ""}`,
+          ]
           let current = ""
           for (const match of final) {
             if (current !== match.path) {
