@@ -1,7 +1,7 @@
 /**
  * OpenCode Plugin: opencode-composer-bridge
  *
- * Cursor / Composer 工具名与参数 → OpenCode（read/write/edit/glob/grep + 别名）。
+ * Cursor / Composer 工具名与参数 → OpenCode（read/write/edit + 别名；grep/glob 走内置）。
  *
  * @author sky
  */
@@ -12,7 +12,7 @@ const CURSOR_TOOL_MAP =
 import fs from "fs"
 import path from "path"
 import { spawnSync } from "child_process"
-import { tool, type ToolContext } from "@opencode-ai/plugin"
+import { tool, type Plugin, type PluginInput } from "@opencode-ai/plugin"
 
 type ArgRecord = Record<string, unknown>
 
@@ -22,13 +22,6 @@ const MAX_LINE_SUFFIX = `... (line truncated to ${MAX_LINE_LENGTH} chars)`
 const MAX_BYTES = 50 * 1024
 const MAX_BYTES_LABEL = `${MAX_BYTES / 1024} KB`
 const SAMPLE_BYTES = 4096
-const GLOB_LIMIT = 100
-const GLOB_STAT_CAP = 400
-const GREP_LIMIT = 100
-const RG_TIMEOUT_MS = 30_000
-/** 低于此耗时的 ETIMEDOUT 视为 spawn 失败误报，不算真超时（Windows 常见） */
-const RG_TIMEOUT_TRUST_MS = 5000
-
 const PATH_KEYS = ["filePath", "path", "file", "filepath", "file_path"]
 const GLOB_PATTERN_KEYS = ["pattern", "glob_pattern", "glob", "file_pattern"]
 const GREP_PATTERN_KEYS = ["pattern", "query", "search", "regex"]
@@ -84,21 +77,6 @@ const resolveWriteContent = (args: ArgRecord, toolName: string): string => {
   if (v !== undefined) return v
   missingParam(toolName, "content", WRITE_BODY_KEYS, [{ path: "a.kt", contents: "..." }], args)
 }
-
-const resolveGlobPattern = (args: ArgRecord): string => {
-  const v = pickString(args, GLOB_PATTERN_KEYS)
-  if (v) return v
-  missingParam("glob", "pattern", GLOB_PATTERN_KEYS, [{ pattern: "**/*.kt", path: "." }], args)
-}
-
-const resolveGrepPattern = (args: ArgRecord): string => {
-  const v = pickString(args, GREP_PATTERN_KEYS)
-  if (v) return v
-  missingParam("grep", "pattern", GREP_PATTERN_KEYS, [{ pattern: "Foo", path: "." }], args)
-}
-
-const resolveSearchRoot = (args: ArgRecord, fallback: string): string =>
-  pickString(args, SEARCH_ROOT_KEYS) ?? fallback
 
 const resolveAbs = (file: string, directory: string): string =>
   path.isAbsolute(file) ? path.normalize(file) : path.resolve(directory, file)
@@ -185,6 +163,33 @@ const performFileReplace = (directory: string, args: ArgRecord, toolName: string
   }
   fs.writeFileSync(filepath, next, "utf8")
   return "Wrote file successfully."
+}
+
+type MultiEditEntry = { path?: string; filePath?: string; oldString?: string; newString?: string; old_string?: string; new_string?: string; replaceAll?: boolean; replace_all?: boolean }
+
+const performMultiEdit = (directory: string, args: ArgRecord, toolName: string): string => {
+  const raw = args.edits ?? args.changes ?? args.operations
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return `[${toolName}] 未提供 edits 数组。示例: {"edits":[{"path":"a.kt","oldString":"x","newString":"y"}]}`
+  }
+  const results: string[] = []
+  for (let i = 0; i < raw.length; i++) {
+    const entry = raw[i] as MultiEditEntry
+    const sub: ArgRecord = {
+      path: entry.path ?? entry.filePath,
+      filePath: entry.filePath ?? entry.path,
+      oldString: entry.oldString ?? entry.old_string,
+      newString: entry.newString ?? entry.new_string,
+      replaceAll: entry.replaceAll ?? entry.replace_all,
+    }
+    try {
+      const msg = performFileReplace(directory, sub, toolName)
+      results.push(`[${i + 1}] ${pickString(sub, PATH_KEYS) ?? "?"}: ${msg}`)
+    } catch (e) {
+      results.push(`[${i + 1}] ${pickString(sub, PATH_KEYS) ?? "?"}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+  return results.join("\n")
 }
 
 const performWrite = (directory: string, args: ArgRecord, toolName: string): string => {
@@ -293,21 +298,24 @@ const formatDirectoryListing = (filepath: string, offset: number, limit: number)
   ].join("\n")
 }
 
-const resolveListDirPath = (args: ArgRecord, directory: string, toolName: string): string => {
+const resolveListDirPath = (args: ArgRecord, directory: string): string => {
   const raw = pickString(args, PATH_KEYS)
   const rel = raw ?? "."
   return normalizeWin(resolveAbs(rel, directory))
 }
 
-const resolveShellCommand = (args: ArgRecord, toolName: string): string => {
+const resolveShellCommand = (args: ArgRecord): string | undefined => {
   const v = pickString(args, RUN_CMD_KEYS, false)
   if (v !== undefined && v.length > 0) return v
-  missingParam(toolName, "command", RUN_CMD_KEYS, [{ command: "echo ok" }], args)
+  return undefined
 }
 
 /** Cursor run_terminal_cmd：本地 shell 执行，语义对齐 bash（非 OpenCode 持久会话） */
 const runBridgedShell = (directory: string, args: ArgRecord, toolName: string): string => {
-  const command = resolveShellCommand(args, toolName)
+  const command = resolveShellCommand(args)
+  if (!command) {
+    return `[${toolName}] 未提供 command，未执行。示例: {"command":"echo ok"}`
+  }
   const workdirRaw = pickString(args, WORKDIR_KEYS)
   const cwd = workdirRaw
     ? normalizeWin(resolveAbs(workdirRaw, directory))
@@ -347,264 +355,76 @@ const runBridgedShell = (directory: string, args: ArgRecord, toolName: string): 
   return parts.join("\n")
 }
 
-const msSince = (start: bigint): number => Number(process.hrtime.bigint() - start) / 1e6
+const normalizeBuiltinToolArgs = (toolName: string, a: ArgRecord): void => {
+  const isGrep =
+    toolName === "grep" ||
+    toolName === "Grep" ||
+    toolName === "codebase_search"
+  const isGlob =
+    toolName === "glob" || toolName === "Glob" || toolName === "file_search"
+  if (!isGrep && !isGlob) return
 
-let cachedRgExe: string | null = null
-
-/** 解析 rg 可执行文件路径；spawn 使用 shell:false，不走 cmd */
-const resolveRgExecutable = (): string => {
-  if (cachedRgExe) return cachedRgExe
-  if (process.platform === "win32") {
-    const w = spawnSync("where.exe", ["rg"], {
-      encoding: "utf8",
-      shell: false,
-      windowsHide: true,
-    })
-    if (w.status === 0) {
-      const line = w.stdout
-        .split(/\r?\n/)
-        .map((l) => l.trim())
-        .find((l) => l.length > 0)
-      if (line) {
-        cachedRgExe = line
-        return cachedRgExe
-      }
+  if (isGrep) {
+    if (!pickString(a, ["pattern"]) && pickString(a, ["query", "search", "regex"])) {
+      const p = pickString(a, GREP_PATTERN_KEYS)
+      if (p) a.pattern = p
     }
-  }
-  cachedRgExe = "rg"
-  return cachedRgExe
-}
-
-type RgResult = {
-  ok: boolean
-  stdout: string
-  stderr: string
-  elapsedMs: number
-  timedOut: boolean
-  spawnFailed: boolean
-}
-
-const runRipgrep = (args: string[], cwd: string): RgResult => {
-  const t0 = process.hrtime.bigint()
-  const result = spawnSync(resolveRgExecutable(), args, {
-    cwd,
-    encoding: "utf8",
-    maxBuffer: 32 * 1024 * 1024,
-    windowsHide: true,
-    shell: false,
-    timeout: RG_TIMEOUT_MS,
-  })
-  const elapsedMs = msSince(t0)
-  const errCode = (result.error as NodeJS.ErrnoException | undefined)?.code
-  const timedOut =
-    (result.signal === "SIGTERM" && elapsedMs >= RG_TIMEOUT_MS - 500) ||
-    (errCode === "ETIMEDOUT" && elapsedMs >= RG_TIMEOUT_TRUST_MS)
-  const spawnFailed =
-    !timedOut &&
-    elapsedMs < RG_TIMEOUT_TRUST_MS &&
-    (result.error != null || result.status === null || (result.status != null && result.status > 1))
-  const ok = !timedOut && !spawnFailed && (result.status === 0 || result.status === 1)
-  return {
-    ok,
-    stdout: (result.stdout ?? "").toString(),
-    stderr: (result.stderr ?? "").toString(),
-    elapsedMs,
-    timedOut,
-    spawnFailed,
-  }
-}
-
-const globWithRipgrep = (search: string, pattern: string): RgResult & { paths: string[] } => {
-  const rg = runRipgrep(["--files", "-g", pattern], search)
-  if (!rg.ok && !rg.stdout) {
-    return { ...rg, paths: [] }
-  }
-  const paths = rg.stdout
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .map((rel) => (path.isAbsolute(rel) ? rel : path.resolve(search, rel)))
-  return { ...rg, paths }
-}
-
-const FAST_GLOB_INSTALL =
-  "在 ~/.config/opencode 执行: npm install fast-glob（或通过 opencode.json 的 plugin git 安装本包，会自动装依赖）。"
-
-const globWithFastGlob = async (search: string, pattern: string): Promise<string[]> => {
-  let fg: { default: (p: string, o: object) => Promise<string[]> }
-  try {
-    fg = await import("fast-glob")
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    throw new Error(`[glob] 无法加载 fast-glob: ${msg}\n${FAST_GLOB_INSTALL}`)
-  }
-  return (await fg.default(pattern, {
-    cwd: search,
-    absolute: true,
-    onlyFiles: true,
-    suppressErrors: true,
-  })) as string[]
-}
-
-const grepWithRipgrep = (
-  cwd: string,
-  pattern: string,
-  include?: string,
-  singleFile?: string,
-): { path: string; line: number; text: string }[] => {
-  const args = ["-n", "--no-heading", pattern]
-  if (include) args.push("-g", include)
-  args.push(singleFile ?? ".")
-  const { stdout, timedOut, elapsedMs, spawnFailed, stderr } = runRipgrep(args, cwd)
-  if (timedOut) {
-    throw new Error(
-      `[rg] 超时（约 ${Math.round(elapsedMs)}ms，上限 ${RG_TIMEOUT_MS / 1000}s）。请缩小 path 或 pattern。`,
-    )
-  }
-  if (spawnFailed && !stdout.trim()) {
-    const hint = stderr.trim() || "请确认已安装 ripgrep（rg 在 PATH）"
-    throw new Error(`[rg] 未能执行搜索（约 ${Math.round(elapsedMs)}ms）。${hint}`)
-  }
-  const rows: { path: string; line: number; text: string }[] = []
-  for (const row of stdout.split(/\r?\n/)) {
-    if (!row) continue
-    const m = row.match(/^(.+?):(\d+):(.*)$/)
-    if (!m) continue
-    const p = path.isAbsolute(m[1]) ? m[1] : path.join(cwd, m[1])
-    rows.push({ path: normalizeWin(p), line: Number(m[2]), text: m[3] })
-  }
-  return rows
-}
-
-const sortPathsByMtime = (paths: string[], cap: number): { path: string; mtime: number }[] => {
-  const subset = paths.length > cap ? paths.slice(0, cap) : paths
-  const withMtime: { path: string; mtime: number }[] = []
-  for (const p of subset) {
-    try {
-      withMtime.push({ path: p, mtime: fs.statSync(p).mtimeMs })
-    } catch {
-      // 跳过
-    }
-  }
-  withMtime.sort((x, y) => y.mtime - x.mtime)
-  return withMtime
-}
-
-const runGlob = async (directory: string, args: ArgRecord): Promise<string> => {
-  const t0 = process.hrtime.bigint()
-  const pattern = resolveGlobPattern(args)
-  const search = normalizeWin(resolveAbs(resolveSearchRoot(args, directory), directory))
-  if (!fs.existsSync(search)) throw new Error(`glob path must exist: ${search}`)
-  if (!fs.statSync(search).isDirectory()) throw new Error(`glob path must be a directory: ${search}`)
-  let paths: string[] = []
-  let rgMs = 0
-  let fgMs = 0
-  let globEngine = ""
-
-  const tRg = process.hrtime.bigint()
-  const rgOut = globWithRipgrep(search, pattern)
-  rgMs = msSince(tRg)
-
-  if (!rgOut.timedOut && rgOut.paths.length > 0) {
-    paths = rgOut.paths
-    globEngine = `rg ${rgMs.toFixed(1)}ms`
-  } else {
-    if (rgOut.timedOut) {
-      globEngine = `rg 超时约 ${Math.round(rgOut.elapsedMs)}ms → `
-    } else if (rgOut.stderr && /not found|ENOENT|不是内部|无法将/i.test(rgOut.stderr)) {
-      globEngine = "rg 未安装 → "
-    } else if (rgOut.paths.length === 0) {
-      globEngine = "rg 无匹配 → "
-    }
-    const tFg = process.hrtime.bigint()
-    paths = await globWithFastGlob(search, pattern)
-    fgMs = msSince(tFg)
-    globEngine += `fast-glob ${fgMs.toFixed(1)}ms`
-    if (rgOut.timedOut && paths.length === 0) {
-      throw new Error(
-        `[glob] rg 超时（约 ${Math.round(rgOut.elapsedMs)}ms）且 fast-glob 无结果。path=${search} pattern=${pattern}`,
-      )
+    const inc = pickString(a, ["include", "glob"], false)
+    if (inc && !a.include) a.include = inc.startsWith("**/") ? inc.slice(3) : inc
+    for (const k of ["query", "search", "regex", "glob", "glob_pattern", "file_pattern"]) {
+      delete a[k]
     }
   }
 
-  const tStat = process.hrtime.bigint()
-  const totalFound = paths.length
-  const withMtime = sortPathsByMtime(paths, GLOB_STAT_CAP)
-  const statMs = msSince(tStat)
-  const truncated = withMtime.length > GLOB_LIMIT
-  const shown = truncated ? withMtime.slice(0, GLOB_LIMIT) : withMtime
-  const timingParts = [`total ${msSince(t0).toFixed(1)}ms`, globEngine, `stat/sort ${statMs.toFixed(1)}ms`]
-  const out: string[] = [`[glob timing] ${timingParts.join(", ")} | found ${totalFound} path(s)`]
-  if (shown.length === 0) out.push("No files found")
-  else {
-    out.push(...shown.map((f) => f.path))
-    if (truncated || totalFound > GLOB_STAT_CAP) {
-      out.push("")
-      out.push(
-        `(Showing ${shown.length} of ${totalFound} paths; stat capped at ${GLOB_STAT_CAP}. Narrow path or pattern.)`,
-      )
+  if (isGlob) {
+    if (!pickString(a, ["pattern"]) && pickString(a, GLOB_PATTERN_KEYS)) {
+      const p = pickString(a, GLOB_PATTERN_KEYS)
+      if (p) a.pattern = p
     }
+    const root = pickString(a, SEARCH_ROOT_KEYS)
+    if (root && !a.path) a.path = root
+    for (const k of ["glob_pattern", "glob", "file_pattern", "target_directory", "directory", "cwd", "dir", "root"]) {
+      delete a[k]
+    }
+    if (!pickString(a, ["pattern"])) a.pattern = "**/*"
   }
-  return out.join("\n")
 }
 
-const runGrep = (directory: string, args: ArgRecord): string => {
-  const t0 = process.hrtime.bigint()
-  const pattern = resolveGrepPattern(args)
-  const requested = normalizeWin(resolveAbs(resolveSearchRoot(args, directory), directory))
-  if (!fs.existsSync(requested)) {
-    return `[grep timing] total ${msSince(t0).toFixed(1)}ms | found 0 matches\nNo files found`
+const coerceGrepPattern = (a: ArgRecord): string | undefined => {
+  const p = pickString(a, ["pattern", "query", "search", "regex"])
+  if (p) return p
+  const onlyPath = pickString(a, PATH_KEYS) ?? pickString(a, SEARCH_ROOT_KEYS)
+  if (onlyPath && fs.existsSync(onlyPath) && fs.statSync(onlyPath).isFile()) {
+    return path.basename(onlyPath)
   }
-  const info = fs.statSync(requested)
-  const cwd = info.isDirectory() ? requested : path.dirname(requested)
-  const singleFile = info.isDirectory() ? undefined : requested
-  const include = pickString(args, ["include", "glob"], false)
-  const tRg = process.hrtime.bigint()
-  const rows = grepWithRipgrep(cwd, pattern, include, singleFile)
-  const rgMs = msSince(tRg)
-  if (rows.length === 0) {
-    return `[grep timing] total ${msSince(t0).toFixed(1)}ms, rg ${rgMs.toFixed(1)}ms | found 0 matches\nNo files found`
-  }
-  const tPost = process.hrtime.bigint()
-  const times = new Map<string, number>()
-  for (const p of new Set(rows.map((r) => r.path))) {
-    try {
-      times.set(p, fs.statSync(p).mtimeMs)
-    } catch {
-      // 跳过
-    }
-  }
-  const matches = rows
-    .map((r) => ({ ...r, mtime: times.get(r.path) ?? 0 }))
-    .filter((r) => times.has(r.path))
-  matches.sort((x, y) => y.mtime - x.mtime)
-  const total = matches.length
-  const truncated = total > GREP_LIMIT
-  const final = truncated ? matches.slice(0, GREP_LIMIT) : matches
-  const postMs = msSince(tPost)
-  const output = [
-    `[grep timing] total ${msSince(t0).toFixed(1)}ms (rg ${rgMs.toFixed(1)}ms, post ${postMs.toFixed(1)}ms) | found ${total} match(es)`,
-    `Found ${total} matches${truncated ? ` (showing first ${GREP_LIMIT})` : ""}`,
-  ]
-  let current = ""
-  for (const match of final) {
-    if (current !== match.path) {
-      if (current !== "") output.push("")
-      current = match.path
-      output.push(`${match.path}:`)
-    }
-    const text =
-      match.text.length > MAX_LINE_LENGTH
-        ? match.text.substring(0, MAX_LINE_LENGTH) + "..."
-        : match.text
-    output.push(`  Line ${match.line}: ${text}`)
-  }
-  if (truncated) {
-    output.push("")
-    output.push(`(Truncated: ${GREP_LIMIT} of ${total} shown.)`)
-  }
-  return output.join("\n")
+  return undefined
 }
+
+const coerceFileFindQuery = (a: ArgRecord): string => {
+  const q = pickString(a, ["pattern", "query", "glob_pattern", "glob", "file_pattern"])
+  if (q) return q
+  const p = pickString(a, PATH_KEYS) ?? pickString(a, SEARCH_ROOT_KEYS)
+  if (p) {
+    const base = path.basename(p.replace(/\\/g, "/"))
+    if (base && base !== "." && base !== "..") return base.includes("*") ? base : `**/*${base}*`
+  }
+  return "**/*"
+}
+
+const resolveSearchDirectory = (a: ArgRecord, ctxDir: string): string => {
+  const raw = pickString(a, SEARCH_ROOT_KEYS) ?? pickString(a, PATH_KEYS) ?? "."
+  const abs = normalizeWin(resolveAbs(raw, ctxDir))
+  if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+    return path.dirname(abs)
+  }
+  return abs
+}
+
+const softSearchHint = (toolName: string, kind: "text" | "files"): string =>
+  `[${toolName}] 未提供搜索内容，未执行检索。\n` +
+  (kind === "text"
+    ? '请传入 pattern / query，例如: {"pattern":"Foo","path":"."}'
+    : '请传入 pattern / query，例如: {"pattern":"**/*.kt","path":"."} 或 {"query":"README"}')
 
 const TOOL_DOC = {
   read:
@@ -618,8 +438,144 @@ const TOOL_DOC = {
   glob:
     "Glob files. Required: pattern OR glob_pattern. Optional: path OR target_directory. Example: {\"pattern\":\"**/*.kt\",\"path\":\".\"}",
   grep:
-    "Grep content. Required: pattern OR query. Optional: path, include. Example: {\"pattern\":\"Foo\",\"path\":\".\",\"include\":\"*.kt\"}",
+    "Grep content. Required: pattern OR query. Optional: path, include/glob, head_limit. Example: {\"pattern\":\"Foo|Bar\",\"path\":\".\",\"glob\":\"**/*.kt\",\"head_limit\":25}",
 }
+
+type FindTextRow = {
+  path: { text: string }
+  lines: { text: string }
+  line_number: number
+}
+
+const formatSdkError = (err: unknown): string => {
+  if (err == null) return "unknown"
+  if (typeof err === "string") return err
+  if (typeof err === "object") {
+    const o = err as Record<string, unknown>
+    if (typeof o.message === "string") return o.message
+    if (typeof o.error === "string") return o.error
+    try {
+      return JSON.stringify(err)
+    } catch {
+      return String(err)
+    }
+  }
+  return String(err)
+}
+
+const unwrapSdkData = <T>(res: { data?: T; error?: unknown }): T => {
+  if (res.error) {
+    throw new Error(`[opencode find API] ${formatSdkError(res.error)}`)
+  }
+  if (res.data === undefined) throw new Error("[opencode find API] 无返回数据")
+  return res.data
+}
+
+const formatFindTextResults = (rows: FindTextRow[], cap: number): string => {
+  if (rows.length === 0) return "No files found"
+  const truncated = rows.length > cap
+  const slice = truncated ? rows.slice(0, cap) : rows
+  const lines: string[] = [
+    `Found ${rows.length} matches${truncated ? ` (showing first ${cap})` : ""}`,
+  ]
+  let current = ""
+  for (const row of slice) {
+    const fp = row.path.text
+    if (current !== fp) {
+      if (current !== "") lines.push("")
+      current = fp
+      lines.push(`${fp}:`)
+    }
+    const text =
+      row.lines.text.length > MAX_LINE_LENGTH
+        ? row.lines.text.substring(0, MAX_LINE_LENGTH) + "..."
+        : row.lines.text
+    lines.push(`  Line ${row.line_number}: ${text}`)
+  }
+  if (truncated) {
+    lines.push("")
+    lines.push(`(Truncated: ${cap} of ${rows.length} shown.)`)
+  }
+  return lines.join("\n")
+}
+
+const cursorSearchArgSchema = {
+  pattern: tool.schema.string().optional(),
+  query: tool.schema.string().optional(),
+  search: tool.schema.string().optional(),
+  regex: tool.schema.string().optional(),
+  path: tool.schema.string().optional(),
+  target_directory: tool.schema.string().optional(),
+  include: tool.schema.string().optional(),
+  glob: tool.schema.string().optional(),
+  glob_pattern: tool.schema.string().optional(),
+  file_pattern: tool.schema.string().optional(),
+  head_limit: tool.schema.coerce.number().int().positive().optional(),
+  headLimit: tool.schema.coerce.number().int().positive().optional(),
+  limit: tool.schema.coerce.number().int().positive().optional(),
+  num: tool.schema.coerce.number().int().positive().optional(),
+}
+
+const makeSdkTextSearchTool = (description: string, client: PluginInput["client"]) =>
+  tool({
+    description: `${description}（经 OpenCode 服务端 ripgrep，等同内置 grep）`,
+    args: cursorSearchArgSchema,
+    async execute(args, ctx) {
+      const a = { ...(args as ArgRecord) }
+      normalizeBuiltinToolArgs("grep", a)
+      const pattern = coerceGrepPattern(a)
+      if (!pattern) return softSearchHint(description, "text")
+      const directory = resolveSearchDirectory(a, ctx.directory)
+      let rows: FindTextRow[]
+      try {
+        const res = await client.find.text({
+          query: { directory, pattern },
+        })
+        rows = unwrapSdkData(res) as FindTextRow[]
+      } catch (e) {
+        return `[${description}] 检索失败: ${e instanceof Error ? e.message : String(e)}\nNo files found`
+      }
+      const cap =
+        typeof a.head_limit === "number"
+          ? Math.min(a.head_limit, 500)
+          : typeof a.limit === "number"
+            ? Math.min(a.limit, 500)
+            : 100
+      return formatFindTextResults(rows, cap)
+    },
+  })
+
+const makeSdkFileSearchTool = (description: string, client: PluginInput["client"]) =>
+  tool({
+    description: `${description}（经 OpenCode 服务端，等同内置 glob）`,
+    args: {
+      ...cursorSearchArgSchema,
+      query: tool.schema.string().optional(),
+    },
+    async execute(args, ctx) {
+      const a = { ...(args as ArgRecord) }
+      normalizeBuiltinToolArgs("glob", a)
+      const query = coerceFileFindQuery(a)
+      const directory = resolveSearchDirectory(a, ctx.directory)
+      const limit =
+        typeof a.limit === "number" ? Math.min(a.limit, 500) : typeof a.head_limit === "number" ? Math.min(a.head_limit, 500) : 100
+      let paths: string[]
+      try {
+        const res = await client.find.files({
+          query: { directory, query, limit },
+        })
+        paths = unwrapSdkData(res) as string[]
+      } catch (e) {
+        return `[${description}] 检索失败: ${e instanceof Error ? e.message : String(e)}\nNo files found`
+      }
+      if (paths.length === 0) return "No files found"
+      const truncated = paths.length > limit
+      const shown = truncated ? paths.slice(0, limit) : paths
+      const out = [`Found ${paths.length} path(s)${truncated ? ` (showing first ${limit})` : ""}`, ...shown]
+      if (truncated) out.push("", `(Truncated: ${limit} of ${paths.length} shown.)`)
+      return out.join("\n")
+    },
+  })
 
 const pathArgSchema = {
   filePath: tool.schema.string().optional(),
@@ -643,28 +599,6 @@ const writeArgSchema = {
   contents: tool.schema.string().optional(),
 }
 
-const globArgSchema = {
-  pattern: tool.schema.string().optional(),
-  glob_pattern: tool.schema.string().optional(),
-  glob: tool.schema.string().optional(),
-  file_pattern: tool.schema.string().optional(),
-  path: tool.schema.string().optional(),
-  target_directory: tool.schema.string().optional(),
-  directory: tool.schema.string().optional(),
-  cwd: tool.schema.string().optional(),
-}
-
-const grepArgSchema = {
-  pattern: tool.schema.string().optional(),
-  query: tool.schema.string().optional(),
-  search: tool.schema.string().optional(),
-  regex: tool.schema.string().optional(),
-  path: tool.schema.string().optional(),
-  target_directory: tool.schema.string().optional(),
-  include: tool.schema.string().optional(),
-  glob: tool.schema.string().optional(),
-}
-
 const makeEditTool = (id: string, description: string) =>
   tool({
     description,
@@ -683,12 +617,29 @@ const makeWriteTool = (id: string, description: string) =>
     },
   })
 
-const makeGrepTool = (id: string, description: string) =>
+const multiEditEntrySchema = tool.schema.object({
+  path: tool.schema.string().optional(),
+  filePath: tool.schema.string().optional(),
+  oldString: tool.schema.string().optional(),
+  newString: tool.schema.string().optional(),
+  old_string: tool.schema.string().optional(),
+  new_string: tool.schema.string().optional(),
+  replaceAll: tool.schema.boolean().optional(),
+  replace_all: tool.schema.boolean().optional(),
+})
+
+const multiEditArgSchema = {
+  edits: tool.schema.array(multiEditEntrySchema).optional(),
+  changes: tool.schema.array(multiEditEntrySchema).optional(),
+  operations: tool.schema.array(multiEditEntrySchema).optional(),
+}
+
+const makeMultiEditTool = (id: string) =>
   tool({
-    description,
-    args: grepArgSchema,
+    description: `Cursor「${id}」→ 按 edits/changes 数组依次 StrReplace。`,
+    args: multiEditArgSchema,
     async execute(args, ctx) {
-      return runGrep(ctx.directory, args as ArgRecord)
+      return performMultiEdit(ctx.directory, args as ArgRecord, id)
     },
   })
 
@@ -697,7 +648,7 @@ const cursorStub = (name: string, use: string) =>
     description: `Cursor「${name}」→ 请用 **${use}**。`,
     args: { note: tool.schema.string().optional() },
     async execute() {
-      throw new Error(`[${name}] ${CURSOR_TOOL_MAP}\n请改用: ${use}`)
+      return `[${name}] 请改用: ${use}。（${CURSOR_TOOL_MAP}）`
     },
   })
 
@@ -713,7 +664,7 @@ const makeListDirTool = (id: string) =>
     args: listDirArgSchema,
     async execute(args, ctx) {
       const a = args as ArgRecord
-      const filepath = resolveListDirPath(a, ctx.directory, id)
+      const filepath = resolveListDirPath(a, ctx.directory)
       if (!fs.existsSync(filepath)) throw new Error(fileNotFoundHint(filepath))
       if (!fs.statSync(filepath).isDirectory()) {
         throw new Error(`[${id}] 不是目录: ${filepath}（请用 read 读文件）`)
@@ -744,10 +695,8 @@ const makeRunTerminalTool = (id: string) =>
     },
   })
 
-const hasAnyKey = (a: ArgRecord, keys: string[]) =>
-  keys.some((k) => typeof a[k] === "string" && String(a[k]).trim().length > 0)
-
-export const OpencodeComposerBridgePlugin = async () => {
+export const OpencodeComposerBridgePlugin: Plugin = async (input) => {
+  const { client } = input
   return {
     "tool.definition": async (
       input: { toolID: string },
@@ -763,7 +712,7 @@ export const OpencodeComposerBridgePlugin = async () => {
     ) => {
       output.system.push(
         `## Cursor / Composer → OpenCode\n${CURSOR_TOOL_MAP}\n` +
-          "改文件: **edit**。整文件: **write**。终端: **bash**（勿用 run_terminal_cmd）。",
+          "改文件: **edit**。整文件: **write**。搜代码: **grep** / **glob**（内置）；**Grep** / **Glob** / **codebase_search** 走服务端 find。终端: **bash**。",
       )
     },
 
@@ -773,30 +722,24 @@ export const OpencodeComposerBridgePlugin = async () => {
     ) => {
       const name = input.tool
       const a = (output.args ?? {}) as ArgRecord
-      if (name === "grep" || name === "Grep") {
-        if (!hasAnyKey(a, GREP_PATTERN_KEYS)) {
-          throw new Error(`[${name}] 缺少 pattern（禁止 {}）。示例: {"pattern":"Foo","path":"."}`)
-        }
-      }
-      if (name === "glob" || name === "Glob") {
-        if (!hasAnyKey(a, GLOB_PATTERN_KEYS)) {
-          throw new Error(`[${name}] 缺少 pattern。示例: {"pattern":"**/*.kt","path":"."}`)
-        }
-      }
+      output.args = a
+      normalizeBuiltinToolArgs(name, a)
     },
 
     tool: {
       list_dir: makeListDirTool("list_dir"),
       ListDir: makeListDirTool("ListDir"),
       LS: makeListDirTool("LS"),
-      ApplyPatch: cursorStub("ApplyPatch", "edit 或 apply_patch"),
-      Delete: cursorStub("Delete", "bash"),
+      ApplyPatch: cursorStub("ApplyPatch", "StrReplace / edit（patch 传参易被截断）"),
+      Delete: cursorStub("Delete", "bash（勿在插件内自动删文件）"),
       delete_file: cursorStub("delete_file", "bash"),
-      MultiEdit: cursorStub("MultiEdit", "多次 edit"),
+      MultiEdit: makeMultiEditTool("MultiEdit"),
       run_terminal_cmd: makeRunTerminalTool("run_terminal_cmd"),
       run_terminal_command: makeRunTerminalTool("run_terminal_command"),
-      codebase_search: cursorStub("codebase_search", "grep"),
-      file_search: cursorStub("file_search", "glob"),
+      codebase_search: makeSdkTextSearchTool("Cursor codebase_search", client),
+      file_search: makeSdkFileSearchTool("Cursor file_search", client),
+      Grep: makeSdkTextSearchTool("Cursor Grep", client),
+      Glob: makeSdkFileSearchTool("Cursor Glob", client),
 
       read: tool({
         description: TOOL_DOC.read,
@@ -849,17 +792,6 @@ export const OpencodeComposerBridgePlugin = async () => {
       StrReplace: makeEditTool("StrReplace", TOOL_DOC.StrReplace),
       strreplace: makeEditTool("strreplace", TOOL_DOC.StrReplace),
       search_replace: makeEditTool("search_replace", "Cursor alias → same as edit."),
-
-      glob: tool({
-        description: TOOL_DOC.glob,
-        args: globArgSchema,
-        async execute(args, ctx) {
-          return runGlob(ctx.directory, args as ArgRecord)
-        },
-      }),
-
-      grep: makeGrepTool("grep", TOOL_DOC.grep),
-      Grep: makeGrepTool("Grep", "Cursor alias → same as grep（必须带 pattern）"),
     },
   }
 }

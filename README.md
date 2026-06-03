@@ -1,22 +1,22 @@
 # opencode-composer-bridge
 
-本插件用于在 **OpenCode** 中运行 **Cursor Composer 2.5** 时，对齐双方工具名与参数约定。Composer 侧常使用 `StrReplace`、`path`、`glob_pattern` 等字段；OpenCode 内置工具要求 `edit`、`filePath`、`pattern` 等。不一致时会出现 `invalid` 或 schema 校验失败。插件在 OpenCode 侧完成名称与参数的映射，使读写、编辑与搜索类工具调用可正常执行。
+在 **OpenCode** 里用 **Cursor Composer** 时，对齐 Cursor 的工具名与参数，减少 `invalid` 和参数校验失败。
 
-## 功能
+## 做什么
 
-- 注册 Cursor 侧常用工具名（如 `StrReplace`、`Write`、`search_replace`），行为对应 `edit`、`write` 等
-- 参数别名：`path` / `filePath`，`glob_pattern`、`target_directory` / `pattern`、`path` 等
-- 覆盖 `read`、`write`、`edit`、`glob`、`grep`；`edit` 支持 Windows CRLF 与 LF 自动匹配
-- `glob`、`grep` 优先调用 `rg`；`glob` 在无 `rg` 时回退 `fast-glob`
-- 对 `list_dir`、`ApplyPatch` 等无内置同名工具的名称，返回 OpenCode 侧应使用的工具说明
+| 类别 | 工具 | 行为 |
+|------|------|------|
+| 读写改 | `read`、`write`、`edit` 及 `Write`、`StrReplace`、`search_replace` 等 | 插件实现；支持 `path` / `filePath`、`contents` / `content`；`edit` 兼容 CRLF |
+| 目录 / 终端 | `list_dir`、`ListDir`、`LS`、`run_terminal_cmd` | 插件实现（列目录、本地 PowerShell/sh） |
+| 搜内容 / 找文件 | `grep`、`glob` | **不覆盖**，用 OpenCode 内置（ripgrep）；`tool.execute.before` 做参数别名 |
+| Cursor 专用名 | `Grep`、`Glob`、`codebase_search`、`file_search` | 经 OpenCode **服务端** `find` API（与内置同源 ripgrep） |
+| 占位说明 | `ApplyPatch`、`Delete`、`MultiEdit` 等 | 提示改用 `edit` / `bash` / `apply_patch` |
+
+`tool.execute.before` 会把常见 Cursor 字段归一，例如：`query` → `pattern`，`glob_pattern` → `pattern`，`target_directory` → `path`。
 
 ## 安装
 
-任选其一，完成后重启 OpenCode。
-
-### 通过 `plugin`（推荐）
-
-在 `~/.config/opencode/opencode.json`（Windows：`%USERPROFILE%\.config\opencode\opencode.json`）的 `plugin` 中加入：
+改 `~/.config/opencode/opencode.json`（Windows：`%USERPROFILE%\.config\opencode\opencode.json`），在 `plugin` 中加入：
 
 ```json
 "plugin": [
@@ -24,27 +24,14 @@
 ]
 ```
 
-由 OpenCode 拉取仓库并安装 `package.json` 中的依赖（含 `fast-glob`）。
+或把仓库 `index.ts` 复制为 `~/.config/opencode/plugins/opencode-composer-bridge.ts`。
 
-### 手动复制
-
-将本仓库 `index.ts` 复制为：
-
-`~/.config/opencode/plugins/opencode-composer-bridge.ts`
-
-在 `~/.config/opencode` 目录执行：
-
-```bash
-npm install fast-glob
-```
+安装或更新后 **重启 OpenCode**。
 
 ## 依赖
 
-| 项 | 是否必须 | 说明 |
-|----|----------|------|
-| OpenCode | 是 | 支持 `plugins/*.ts` 或 `plugin` git 包 |
-| `fast-glob` | **glob 必需** | `plugin` git 安装会自动装；仅复制 `index.ts` 时须在 `~/.config/opencode` 执行 `npm install fast-glob`，否则 glob 会报错 |
-| `rg`（ripgrep） | grep 强烈建议；glob 可选 | **grep** 依赖 `rg`；**glob** 优先 `rg`，失败再用 `fast-glob`。未装 `rg` 时 glob 仍可用（仅 fast-glob） |
+- **OpenCode**（`plugins` 或 git `plugin`）
+- 搜代码依赖本机 **ripgrep**（由 OpenCode 内置 `grep`/`glob` 与服务端 `find` 使用，插件不单独安装 `rg`）
 
 ## License
 

@@ -1,7 +1,7 @@
 {
   "name": "opencode-composer-bridge",
   "version": "0.1.0",
-  "description": "OpenCode plugin: Cursor/Composer tool names and args → read/write/edit/glob/grep",
+  "description": "OpenCode plugin: Cursor/Composer tool aliases; grep/glob use built-in ripgrep",
   "type": "module",
   "main": "index.ts",
   "exports": {
@@ -23,9 +23,6 @@
   "license": "MIT",
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.0.0"
-  },
-  "dependencies": {
-    "fast-glob": "^3.3.3"
   },
   "engines": {
     "node": ">=18"
