@@ -38,15 +38,13 @@
 npm install fast-glob
 ```
 
-（该插件在 `glob` 无 `rg` 结果时会 `import("fast-glob")`，需能解析到此依赖。）
-
 ## 依赖
 
 | 项 | 是否必须 | 说明 |
 |----|----------|------|
 | OpenCode | 是 | 支持 `plugins/*.ts` 或 `plugin` git 包 |
-| `fast-glob` | 是（本插件实现） | git 安装时自动装；手动复制时需自行 `npm install` |
-| `rg`（ripgrep） | 否 | 有则 `glob`/`grep` 更快；无则 `glob` 走 `fast-glob`，`grep` 可能无结果 |
+| `fast-glob` | **glob 必需** | `plugin` git 安装会自动装；仅复制 `index.ts` 时须在 `~/.config/opencode` 执行 `npm install fast-glob`，否则 glob 会报错 |
+| `rg`（ripgrep） | grep 强烈建议；glob 可选 | **grep** 依赖 `rg`；**glob** 优先 `rg`，失败再用 `fast-glob`。未装 `rg` 时 glob 仍可用（仅 fast-glob） |
 
 ## License
 
