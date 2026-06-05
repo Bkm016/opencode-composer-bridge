@@ -202,10 +202,32 @@ const performFileReplace = (directory: string, args: ArgRecord, toolName: string
   return "Wrote file successfully."
 }
 
+/** 仅当父目录不存在时创建；已存在目录或 EEXIST 不报错（Windows 上对已有 Desktop 等会 EEXIST） */
+const ensureParentDir = (filepath: string) => {
+  const parent = path.dirname(filepath)
+  if (!parent || parent === "." || parent === filepath) return
+  if (process.platform === "win32") {
+    const parsed = path.parse(parent)
+    if (parsed.root === parent) return
+  }
+  try {
+    if (fs.existsSync(parent)) {
+      const st = fs.statSync(parent)
+      if (st.isDirectory()) return
+      throw new Error(`路径已存在且不是目录: ${parent}`)
+    }
+    fs.mkdirSync(parent, { recursive: true })
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException
+    if (err.code === "EEXIST") return
+    throw e
+  }
+}
+
 const performWrite = (directory: string, args: ArgRecord, toolName: string): string => {
   const filepath = normalizeWin(resolveAbs(resolveFilePath(args, toolName), directory))
   const body = resolveWriteContent(args, toolName)
-  fs.mkdirSync(path.dirname(filepath), { recursive: true })
+  ensureParentDir(filepath)
   fs.writeFileSync(filepath, body, "utf8")
   return "Wrote file successfully."
 }
